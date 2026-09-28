@@ -52,7 +52,7 @@ the host and configuration.
 - `git` on `PATH` (only used for read-only Git-state enrichment; missing git
   degrades gracefully)
 - A model provider configured in OpenCode, exposing a model that follows JSON
-  schemas reliably, or a Jev API key in the trusted process environment (see
+  schemas reliably, or a Jev API key from a supported credential source (see
   [Choosing the reviewer model](#choosing-the-reviewer-model))
 - A permission policy with at least one `ask` rule — **if nothing is `ask`, the
   plugin never activates** (everything is already `allow`/`deny`).
@@ -211,16 +211,23 @@ the result.
 ### Jev System One reviewer
 
 Set `model` in the trusted global `~/.config/opencode/permission-reviewer.jsonc`
-and put the matching key in the **OpenCode server process environment** before
-starting OpenCode. The Jev call uses the provider's System One endpoint directly;
-OpenCode's `/connect` credentials and the Command Code CLI login are not read by
-this call. The supported routes are:
+to use the provider's System One endpoint directly. On **OpenCode V2**, the Zen
+route uses `OPENCODE_API_KEY` when set; otherwise it resolves the active API-key
+connection saved through `/connect`, checking `opencode` first and then
+`opencode-go`. OAuth credentials are not used as API keys. Credentials are resolved
+for each review through OpenCode's integration API and passed directly to the
+System One client, without modifying the server's environment or writing another
+credential file.
 
-| Reviewer `model`                                       | Required environment variable | System One API                                                                                |
-| ------------------------------------------------------ | ----------------------------- | --------------------------------------------------------------------------------------------- |
-| `opencode/jev-1.13` (or `opencode/jev-1.13-free`)      | `OPENCODE_API_KEY`            | [OpenCode Zen](https://opencode.ai/docs/en/zen/#jev)                                          |
-| `typesafe-ai/jev-1.13.0` (or `typesafe-ai/jev-latest`) | `TYPESAFE_API_KEY`            | [TypeSafe AI](https://docs.typesafe.ai/sdk/javascript)                                        |
-| `commandcode/typesafe/jev`                             | `CMD_API_KEY`                 | [Command Code Provider API](https://commandcode.ai/docs/provider#decision-models-typesafejev) |
+On V1, and for the other providers below, put the matching key in the
+**OpenCode server process environment** before starting OpenCode. The Command
+Code CLI login is not read by this call. The supported routes are:
+
+| Reviewer `model`                                       | Credential source                            | System One API                                                                                |
+| ------------------------------------------------------ | -------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `opencode/jev-1.13` (or `opencode/jev-1.13-free`)      | `OPENCODE_API_KEY`, or a saved API key on V2 | [OpenCode Zen](https://opencode.ai/docs/en/zen/#jev)                                          |
+| `typesafe-ai/jev-1.13.0` (or `typesafe-ai/jev-latest`) | `TYPESAFE_API_KEY`                           | [TypeSafe AI](https://docs.typesafe.ai/sdk/javascript)                                        |
+| `commandcode/typesafe/jev`                             | `CMD_API_KEY`                                | [Command Code Provider API](https://commandcode.ai/docs/provider#decision-models-typesafejev) |
 
 For **Jev only**, omit `escalationReviewer`:
 
