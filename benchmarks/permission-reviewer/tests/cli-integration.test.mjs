@@ -68,6 +68,7 @@ test("CLI runs real plugin replay through a local HTTP provider and exports safe
         "run",
         "--repo",
         "../..",
+        "--allow-drift",
         "--models",
         models,
         "--limit",
@@ -89,16 +90,29 @@ test("CLI runs real plugin replay through a local HTTP provider and exports safe
     const full = JSON.parse(await readFile(join(run, "results.json"), "utf8"))
     assert.equal(full.results.length, 3)
     assert(full.summary.complete)
-    assert(full.run.source.match)
-    await exec("node", ["cli.mjs", "export-public", "--run", run, "--out", report], {
-      cwd: benchmark,
-      timeout: 30_000,
-    })
-    const published = JSON.parse(await readFile(report, "utf8"))
-    assert.equal(published.results.length, 3)
-    assert(!JSON.stringify(published).includes("127.0.0.1"))
-    assert(!JSON.stringify(published).includes("Test-only output"))
-    assert(!("prompt" in published.results[0]))
+    // This integration test intentionally replays the working tree, which may
+    // include prompt-only changes beyond the benchmark's pinned source snapshot.
+    if (full.run.source.match) {
+      await exec("node", ["cli.mjs", "export-public", "--run", run, "--out", report], {
+        cwd: benchmark,
+        timeout: 30_000,
+      })
+      const published = JSON.parse(await readFile(report, "utf8"))
+      assert.equal(published.results.length, 3)
+      assert(!JSON.stringify(published).includes("127.0.0.1"))
+      assert(!JSON.stringify(published).includes("Test-only output"))
+      assert(!("prompt" in published.results[0]))
+    } else {
+      assert(full.run.source.inspectedBlobDifferences.length > 0)
+      await assert.rejects(
+        exec("node", ["cli.mjs", "export-public", "--run", run, "--out", report], {
+          cwd: benchmark,
+          timeout: 30_000,
+        }),
+        /Command failed/,
+      )
+      await assert.rejects(readFile(report))
+    }
   } finally {
     await new Promise((resolve) => server.close(resolve))
     await rm(scratch, { recursive: true, force: true })

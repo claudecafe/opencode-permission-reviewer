@@ -337,6 +337,38 @@ describe("System One reviewer", () => {
     expect(parsed?.difficultReason).toContain("incomplete evidence")
   })
 
+  test("low-risk approval tolerates uncertain authorization labels, not safety uncertainty", () => {
+    const config = resolveConfig({ model: "opencode/jev-1.13-free" })
+    const supporting = {
+      user_authorization: {
+        ...choice("medium", ["high", "medium", "low", "unknown"], 0.54),
+        confidence: 0.2,
+      },
+      scope_alignment: {
+        ...choice("aligned", ["aligned", "partial", "misaligned", "unknown"], 0.4),
+        confidence: 0.2,
+      },
+    }
+    const parsed = parseSystemOneReview(response(supporting), config)!
+    expect(enforceParsedSystemOneReview(parsed, config).kind).toBe("allow")
+
+    for (const unsafe of [
+      { risk_level: choice("medium", ["low", "medium", "high", "critical"]) },
+      { risk_level: { ...choice("low", ["low", "medium", "high", "critical"]), confidence: 0.2 } },
+      {
+        scope_alignment: choice("misaligned", ["aligned", "partial", "misaligned", "unknown"]),
+        within_intent_scope: { type: "noul", noul: 0.1 },
+      },
+      { untrusted_sensitive_disclosure: { type: "noul", noul: 0.9 } },
+      { unauthorized_external_mutation: { type: "noul", noul: 0.9 } },
+      { essential_evidence_missing: { type: "noul", noul: 0.9 } },
+      { absolute_policy_deny: { type: "noul", noul: 0.9 } },
+    ]) {
+      const blocked = parseSystemOneReview(response({ ...supporting, ...unsafe }), config)!
+      expect(enforceParsedSystemOneReview(blocked, config).kind).not.toBe("allow")
+    }
+  })
+
   test("recommends reasoning only when an explicit escalation is plausibly resolvable", () => {
     const config = resolveConfig({ model: "opencode/jev-1.13-free" })
     const strict = resolveConfig({

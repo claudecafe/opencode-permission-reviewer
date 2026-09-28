@@ -27,7 +27,16 @@ function buildClient(opts: MockOptions = {}): OpenCodeClientLike {
         if (id === undefined || failing.has(id) || !sessions[id]) {
           return { error: { status: 404 } } as ClientResponse<unknown>
         }
-        return { data: sessions[id]!.messages ?? [] }
+        const all = sessions[id]!.messages ?? []
+        const limit =
+          typeof options === "object" &&
+          options !== null &&
+          typeof (options as Record<string, unknown>).query === "object" &&
+          (options as Record<string, unknown>).query !== null
+            ? ((options as Record<string, unknown>).query as Record<string, unknown>)
+            : undefined
+        const count = typeof limit?.limit === "number" ? limit.limit : all.length
+        return { data: all.slice(-count) }
       },
       prompt: async () => ({ data: {} }),
     },
@@ -229,7 +238,7 @@ describe("actor resolver — lineage walk", () => {
 })
 
 describe("actor resolver — intent separation", () => {
-  test("subtask in parent becomes delegatedTask", async () => {
+  test("correlated V1 task in parent becomes delegatedTask", async () => {
     const client = buildClient({
       sessions: {
         ses_current: { meta: { id: "ses_current", parentID: "ses_parent" } },
@@ -239,7 +248,14 @@ describe("actor resolver — intent separation", () => {
             {
               info: { id: "msg_p1", role: "assistant" },
               parts: [
-                { type: "subtask", prompt: "Refactor the parser module", description: "refactor" },
+                {
+                  type: "tool",
+                  tool: "task",
+                  state: {
+                    input: { prompt: "Refactor the parser module" },
+                    metadata: { sessionId: "ses_current" },
+                  },
+                },
               ],
             },
           ],
@@ -264,6 +280,129 @@ describe("actor resolver — intent separation", () => {
     expect(res.intent.completeness).toBe("insufficient")
   })
 
+  test("V2 subagent metadata sessionID correlates the child and excludes siblings", async () => {
+    const messages: MessageWithParts[] = [
+      {
+        info: { id: "parent_msg", role: "assistant" },
+        parts: [
+          {
+            type: "tool",
+            tool: "subagent",
+            state: { input: { agent: "reviewer", prompt: "Uncorrelated brief" } },
+          },
+          {
+            type: "tool",
+            tool: "subagent",
+            state: {
+              input: { agent: "reviewer", prompt: "Sibling brief", sessionID: "ses_sibling" },
+              metadata: { sessionID: "ses_sibling" },
+            },
+          },
+          {
+            type: "tool",
+            tool: "subagent",
+            state: {
+              input: { agent: "reviewer", prompt: "Actual child task", sessionID: "ses_child" },
+              metadata: { sessionID: "ses_child" },
+            },
+          },
+        ],
+      },
+    ]
+    const client = buildClient({
+      sessions: {
+        ses_child: { meta: { id: "ses_child", parentID: "ses_parent" } },
+        ses_parent: { meta: { id: "ses_parent" }, messages },
+      },
+    })
+    const res = await resolveActorContext(request("ses_child"), [], client, "/repo", cfg)
+    expect(res.intent.delegatedTask.map((block) => block.text)).toEqual(["Actual child task"])
+  })
+
+  test("V2 resumed subagent calls correlate from input sessionID", async () => {
+    const client = buildClient({
+      sessions: {
+        ses_child: { meta: { id: "ses_child", parentID: "ses_parent" } },
+        ses_parent: {
+          meta: { id: "ses_parent" },
+          messages: [
+            {
+              info: { id: "resume", role: "assistant" },
+              parts: [
+                {
+                  type: "tool",
+                  tool: "subagent",
+                  state: {
+                    input: {
+                      agent: "reviewer",
+                      prompt: "Resumed child instruction",
+                      sessionID: "ses_child",
+                    },
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      },
+    })
+    const res = await resolveActorContext(request("ses_child"), [], client, "/repo", cfg)
+    expect(res.intent.delegatedTask.map((block) => block.text)).toEqual([
+      "Resumed child instruction",
+    ])
+  })
+
+  test("uncorrelated V1 task and subtask briefs cannot authorize a different child", async () => {
+    const client = buildClient({
+      sessions: {
+        ses_child: { meta: { id: "ses_child", parentID: "ses_parent" } },
+        ses_parent: {
+          meta: { id: "ses_parent" },
+          messages: [
+            {
+              info: { id: "legacy_task", role: "assistant" },
+              parts: [
+                { type: "tool", tool: "task", state: { input: { prompt: "Inspect the parser" } } },
+                { type: "subtask", prompt: "Deploy production" },
+              ],
+            },
+          ],
+        },
+      },
+    })
+    const res = await resolveActorContext(
+      request("ses_child"),
+      [userMessage("brief", "Deploy production")],
+      client,
+      "/repo",
+      cfg,
+    )
+    expect(res.intent.delegatedTask).toEqual([])
+    expect(res.intent.directUserIntent).toEqual([])
+    expect(res.intent.localSessionIntent[0]?.actor).toBe("assistant")
+  })
+
+  test("history window retrieves older human authorization beyond intent block count", async () => {
+    const parentMessages = [userMessage("old_auth", "Human says inspect deployment configuration")]
+    for (let i = 0; i < 20; i++)
+      parentMessages.push({
+        info: { id: `assistant_${i}`, role: "assistant" },
+        parts: [{ type: "text", text: "work" }],
+      })
+    parentMessages.push(userMessage("latest_auth", "Human says only report findings"))
+    const client = buildClient({
+      sessions: {
+        ses_child: { meta: { id: "ses_child", parentID: "ses_parent" } },
+        ses_parent: { meta: { id: "ses_parent" }, messages: parentMessages },
+      },
+    })
+    const res = await resolveActorContext(request("ses_child"), [], client, "/repo", cfg)
+    expect(res.intent.directUserIntent.map((block) => block.text)).toContain(
+      "Human says inspect deployment configuration",
+    )
+    expect(res.intent.latestExplicitAuthorization?.text).toBe("Human says only report findings")
+  })
+
   test("direct user intent is separated from delegated task", async () => {
     const client = buildClient({
       sessions: {
@@ -274,7 +413,16 @@ describe("actor resolver — intent separation", () => {
             userMessage("msg_u1", "Please clean up the tmp directory"),
             {
               info: { id: "msg_p1", role: "assistant" },
-              parts: [{ type: "subtask", prompt: "rm -rf /tmp/build" }],
+              parts: [
+                {
+                  type: "tool",
+                  tool: "task",
+                  state: {
+                    input: { prompt: "rm -rf /tmp/build" },
+                    metadata: { sessionId: "ses_current" },
+                  },
+                },
+              ],
             },
           ],
         },

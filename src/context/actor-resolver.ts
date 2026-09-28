@@ -279,13 +279,9 @@ function userTextOf(message: MessageWithParts): string | undefined {
   return undefined
 }
 
-/** A delegation recorded as a subtask/task tool part in a parent session.
- *  Task-tool parts carry the spawned child session id in
- *  `state.metadata.sessionId`; when present, only the delegation that created
- *  THIS session is recorded, so sibling subagent briefs are not attributed to
- *  the request under review. The task text is read from `part.prompt` /
- *  `part.description` and, for the normal tool-part shape, from the persisted
- *  call arguments in `state.input`. */
+/** Recover only parent tool calls that identify this child session. V1 uses
+ *  metadata.sessionId; V2 uses metadata.sessionID or input.sessionID on resume.
+ *  Uncorrelated task/subtask text cannot establish which sibling it belongs to. */
 function extractDelegatedTasks(
   messages: MessageWithParts[],
   sessionID: string,
@@ -294,21 +290,18 @@ function extractDelegatedTasks(
   const blocks: IntentBlock[] = []
   for (const message of messages) {
     for (const part of message.parts as Array<Record<string, unknown>>) {
-      const isSubtask = part.type === "subtask"
-      const isTaskTool = part.type === "tool" && part.tool === "task"
-      if (!isSubtask && !isTaskTool) continue
-      let input: Record<string, unknown> | undefined
-      if (isTaskTool) {
-        const state = part.state as Record<string, unknown> | undefined
-        const metadata = state?.metadata as Record<string, unknown> | undefined
-        if (typeof metadata?.sessionId === "string" && metadata.sessionId !== childSessionID) {
-          continue
-        }
-        input =
-          typeof state?.input === "object" && state?.input !== null
-            ? (state.input as Record<string, unknown>)
-            : undefined
-      }
+      const isTaskTool = part.type === "tool" && (part.tool === "task" || part.tool === "subagent")
+      if (!isTaskTool) continue
+      const state = part.state as Record<string, unknown> | undefined
+      const metadata = state?.metadata as Record<string, unknown> | undefined
+      const input =
+        typeof state?.input === "object" && state.input !== null
+          ? (state.input as Record<string, unknown>)
+          : undefined
+      const correlatedChildID = [metadata?.sessionID, metadata?.sessionId, input?.sessionID].find(
+        (id): id is string => typeof id === "string",
+      )
+      if (correlatedChildID !== childSessionID) continue
       const fromInput =
         typeof input?.prompt === "string"
           ? input.prompt
@@ -398,7 +391,7 @@ async function resolveIntent(
   }
   const directUserIntent: IntentBlock[] = currentDelegated ? [] : localSessionIntent
   const delegatedTask: IntentBlock[] = []
-  const limit = Math.max(config.intentMessages, 4)
+  const limit = config.historyMessages
 
   // Immediate parent: delegation that created/instructed this session. The
   // parent's own user messages are human intent only when the parent is
@@ -434,20 +427,22 @@ async function resolveIntent(
   // concatenated local → parent → root, so the last element is the root's
   // latest message even when the current session holds much newer input. When
   // no block carries a timestamp, fall back to the last recovered block.
-  const timestamped = directUserIntent.filter((block) => block.createdAt !== undefined)
+  const boundedDirectUserIntent = directUserIntent.slice(-config.intentMessages)
+  const boundedDelegatedTask = delegatedTask.slice(-config.intentMessages)
+  const timestamped = boundedDirectUserIntent.filter((block) => block.createdAt !== undefined)
   const latestExplicitAuthorization =
     timestamped.length > 0
       ? timestamped.reduce((best, block) =>
           (block.createdAt ?? 0) > (best.createdAt ?? 0) ? block : best,
         )
-      : directUserIntent[directUserIntent.length - 1]
+      : boundedDirectUserIntent[boundedDirectUserIntent.length - 1]
 
   const reasons: string[] = []
-  if (delegatedTask.length === 0 && lineage.depth > 0)
+  if (boundedDelegatedTask.length === 0 && lineage.depth > 0)
     reasons.push("no delegation subtask located in parent session")
   if (lineage.missingParents.length > 0)
     reasons.push(`missing parents: ${lineage.missingParents.join(", ")}`)
-  if (directUserIntent.length === 0)
+  if (boundedDirectUserIntent.length === 0)
     reasons.push(
       currentDelegated
         ? "delegated session: no human-authored user messages exist in this session chain window"
@@ -455,15 +450,15 @@ async function resolveIntent(
     )
 
   const completeness: IntentContext["completeness"] =
-    directUserIntent.length > 0 && (delegatedTask.length > 0 || !currentDelegated)
+    boundedDirectUserIntent.length > 0 && (boundedDelegatedTask.length > 0 || !currentDelegated)
       ? "complete"
-      : directUserIntent.length > 0 || localSessionIntent.length > 0
+      : boundedDirectUserIntent.length > 0 || localSessionIntent.length > 0
         ? "partial"
         : "insufficient"
 
   return {
-    directUserIntent,
-    delegatedTask,
+    directUserIntent: boundedDirectUserIntent,
+    delegatedTask: boundedDelegatedTask,
     localSessionIntent,
     conflictingInstructions: [],
     ...(latestExplicitAuthorization === undefined ? {} : { latestExplicitAuthorization }),
